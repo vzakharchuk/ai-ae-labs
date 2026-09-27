@@ -45,27 +45,68 @@ type RateInput struct {
 	Target string `json:"target" jsonschema:"ISO 4217 code of the target currency, e.g. UAH"`
 }
 
+// SourceKind classifies where a rate value came from. It is a closed set —
+// the model gets an enum, not a free-text label it could mangle.
+type SourceKind string
+
+const (
+	// SourceKindAPI marks a value fetched live from an upstream HTTP API.
+	SourceKindAPI SourceKind = "api"
+	// SourceKindCache marks a value served from CachedTransport instead of a
+	// fresh upstream call (see ratelimit.go).
+	SourceKindCache SourceKind = "cache"
+	// SourceKindMock marks a value from FixtureProvider — no network involved.
+	SourceKindMock SourceKind = "mock"
+)
+
+// Source is the nested provenance record for a rate value: which provider
+// produced it, and what kind of call that was. Split into its own type
+// (rather than a flat string) because a HistoricalPoint needs the exact same
+// pair, and duplicating two fields everywhere is how they drift apart.
+type Source struct {
+	Name string     `json:"name" jsonschema:"Provider name, e.g. nbu, monobank, or fixture"`
+	Kind SourceKind `json:"kind" jsonschema:"Where this value came from: api (live upstream call), cache (served from the local HTTP cache), or mock (offline fixture, no network)"`
+}
+
+// HistoricalPoint is one dated rate observation. It carries its own Source
+// rather than inheriting RateOutput's, because a real multi-day series can
+// mix a fresh point with cached ones — provenance is a per-point fact, not a
+// per-response one.
+type HistoricalPoint struct {
+	Date   string  `json:"date" jsonschema:"Date this point is valid for, YYYY-MM-DD"`
+	Rate   float64 `json:"rate" jsonschema:"Base-to-target rate on this date"`
+	Source Source  `json:"source" jsonschema:"Provenance of this specific point"`
+}
+
 // RateOutput is the tool's output contract.
 //
 // Source is deliberately included: an agent answer that cannot say where a
 // number came from is not auditable, and provenance is a week 3 theme that
-// starts here.
+// starts here. History nests one level deeper (RateOutput -> HistoricalPoint
+// -> Source) to exercise a schema an agent tool will actually need once it
+// answers "how has this rate moved" and not just "what is it now" — today it
+// holds only the point Convert already computed; wiring a real multi-day
+// fetch is a natural next step, not done here.
 type RateOutput struct {
-	Base   string  `json:"base"`
-	Target string  `json:"target"`
-	Rate   float64 `json:"rate" jsonschema:"How many units of target one unit of base buys"`
-	AsOf   string  `json:"as_of" jsonschema:"Rate date, YYYY-MM-DD"`
-	Source string  `json:"source" jsonschema:"Provenance of the rate, e.g. nbu or fixture"`
+	Base    string            `json:"base"`
+	Target  string            `json:"target"`
+	Rate    float64           `json:"rate" jsonschema:"How many units of target one unit of base buys"`
+	AsOf    string            `json:"as_of" jsonschema:"Rate date, YYYY-MM-DD"`
+	Source  Source            `json:"source" jsonschema:"Provenance of the current rate"`
+	History []HistoricalPoint `json:"history" jsonschema:"Recent rate observations for this pair"`
 }
 
 // Provider fetches rates against UAH, which is the axis the National Bank of
 // Ukraine publishes. Keeping this an interface is what lets the tests run
 // offline and the binary run against the real bank.
 type Provider interface {
-	// Name is the provenance label the tool stamps into RateOutput.Source.
+	// Name is the provenance label the tool stamps into RateOutput.Source.Name.
 	// An agent answer that cannot say where a number came from is not
 	// auditable, so every provider must identify itself.
 	Name() string
+	// Kind reports whether this provider's values are live, cached, or a
+	// mock — the second half of Source, closed to three values on purpose.
+	Kind() SourceKind
 	// RatesToUAH returns how many UAH one unit of each listed currency buys,
 	// plus the date the rates are valid for.
 	RatesToUAH(ctx context.Context) (map[string]float64, string, error)
@@ -113,12 +154,17 @@ func Convert(ctx context.Context, p Provider, in RateInput) (RateOutput, error) 
 		return RateOutput{}, err
 	}
 
+	rate := baseUAH / targetUAH
+	src := Source{Name: p.Name(), Kind: p.Kind()}
 	return RateOutput{
 		Base:   base,
 		Target: target,
-		Rate:   baseUAH / targetUAH,
+		Rate:   rate,
 		AsOf:   asOf,
-		Source: p.Name(),
+		Source: src,
+		History: []HistoricalPoint{
+			{Date: asOf, Rate: rate, Source: src},
+		},
 	}, nil
 }
 
@@ -164,6 +210,12 @@ const defaultNBUBaseURL = "https://bank.gov.ua/NBUStatService/v1/statdirectory/e
 
 // Name implements Provider.
 func (p *NBUProvider) Name() string { return "nbu" }
+
+// Kind implements Provider. The NBU directory is always fetched over HTTP —
+// whether that particular call hit the CachedTransport or the real upstream
+// is a transport-layer fact this type does not currently observe, so it
+// reports the honest default, "api", rather than guessing "cache".
+func (p *NBUProvider) Kind() SourceKind { return SourceKindAPI }
 
 // nbuRow is one row of the NBU response.
 type nbuRow struct {
@@ -244,6 +296,10 @@ type FixtureProvider struct {
 // Name implements Provider.
 func (p *FixtureProvider) Name() string { return "fixture" }
 
+// Kind implements Provider. Fixture data never touches the network, so this
+// is the one case the enum can state with full confidence.
+func (p *FixtureProvider) Kind() SourceKind { return SourceKindMock }
+
 // RatesToUAH implements Provider.
 func (p *FixtureProvider) RatesToUAH(context.Context) (map[string]float64, string, error) {
 	if p.Err != nil {
@@ -308,6 +364,10 @@ type monoRow struct {
 
 // Name implements Provider.
 func (p *MonoProvider) Name() string { return "monobank" }
+
+// Kind implements Provider. Same honest default as NBUProvider: a cache hit
+// inside CachedTransport is invisible at this layer today.
+func (p *MonoProvider) Kind() SourceKind { return SourceKindAPI }
 
 // RatesToUAH implements Provider. Only pairs with B=UAH (980) are usable for
 // our cross-rating axis; other rows (e.g. EUR/USD) are skipped rather than
