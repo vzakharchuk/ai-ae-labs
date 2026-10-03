@@ -13,7 +13,27 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/dimetron/ai-eng-course/labs/week2/internal/refund"
+	"github.com/google/jsonschema-go/jsonschema"
 )
+
+// refundOutputSchema is the schema both open_refund_case/check_refund_status
+// (as their OutputSchema) and format/format_status (as their InputSchema)
+// declare, so the edges between them satisfy the engine's requirement that
+// two schema-declaring ends of one edge match exactly
+// (workflow/validation.go, validateStaticSchemas). jsonschema.For infers the
+// shape from refund.Output's own json/jsonschema tags; the Enum line adds
+// the one constraint a Go string field cannot express on its own — Status is
+// `pending` or `already_open` by contract (see the field's jsonschema tag,
+// a description, not an enforced constraint), never anything else a future
+// change to the registry might accidentally produce.
+func refundOutputSchema() (*jsonschema.Schema, error) {
+	s, err := jsonschema.For[refund.Output](nil)
+	if err != nil {
+		return nil, fmt.Errorf("resolve refund.Output schema: %w", err)
+	}
+	s.Properties["status"].Enum = []any{"pending", "already_open"}
+	return s, nil
+}
 
 // newGraph builds the default path: an explicit workflow graph where every
 // call to `open_refund_case` or `check_refund_status` is a node of its own, so
@@ -54,18 +74,41 @@ func newGraph(reg *refund.Registry) (agent.Agent, error) {
 	} else {
 		classify = workflow.NewEmittingFunctionNode("classify", classifyRouteText, cfg)
 	}
+	// Both tool nodes and both format nodes share one schema (built once,
+	// below) so the edges between them satisfy the engine's exact-match
+	// requirement while still carrying the Status enum the Go type alone
+	// cannot express.
+	outSchema, err := refundOutputSchema()
+	if err != nil {
+		return nil, err
+	}
+	inputSchema, err := jsonschema.For[refund.Input](nil)
+	if err != nil {
+		return nil, fmt.Errorf("resolve refund.Input schema: %w", err)
+	}
+	statusInputSchema, err := jsonschema.For[refund.StatusInput](nil)
+	if err != nil {
+		return nil, fmt.Errorf("resolve refund.StatusInput schema: %w", err)
+	}
+
 	prepare := workflow.NewFunctionNode("prepare", refund.Prepare, cfg)
-	openCase, err := workflow.NewToolNodeTyped[refund.Input, refund.Output](refundTool, cfg)
+	openCase, err := workflow.NewToolNodeWithSchemas(refundTool, inputSchema, outSchema, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create refund node: %w", err)
 	}
-	format := workflow.NewFunctionNode("format", refund.Format, cfg)
+	format, err := workflow.NewFunctionNodeWithSchema[refund.Output, string]("format", refund.Format, outSchema, nil, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create format node: %w", err)
+	}
 	prepareStatus := workflow.NewFunctionNode("prepare_status", refund.PrepareStatus, cfg)
-	checkStatus, err := workflow.NewToolNodeTyped[refund.StatusInput, refund.Output](statusTool, cfg)
+	checkStatus, err := workflow.NewToolNodeWithSchemas(statusTool, statusInputSchema, outSchema, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create status node: %w", err)
 	}
-	formatStatus := workflow.NewFunctionNode("format_status", refund.FormatStatus, cfg)
+	formatStatus, err := workflow.NewFunctionNodeWithSchema[refund.Output, string]("format_status", refund.FormatStatus, outSchema, nil, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create format_status node: %w", err)
+	}
 	// The refusal is a declared step, not the absence of one: a request the
 	// domain does not handle gets an answer in the log like every other.
 	refuse := workflow.NewFunctionNode("refuse", refund.OutOfDomain, cfg)
