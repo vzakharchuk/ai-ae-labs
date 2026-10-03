@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/dimetron/ai-eng-course/labs/week1/internal/ratecache"
 )
 
 // Sentinel errors. These matter more than they look: the text of a tool error
@@ -232,7 +234,7 @@ type nbuRow struct {
 func defaultRateHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout:   10 * time.Second,
-		Transport: NewCachedTransport(),
+		Transport: ratecache.NewCachedTransport(),
 	}
 }
 
