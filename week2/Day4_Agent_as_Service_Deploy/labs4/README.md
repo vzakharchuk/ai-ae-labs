@@ -178,3 +178,73 @@ SSE на тому ж контейнері — `"status":"already_open"`. `task w
 - **Docker не бачить `go.mod`:** перевірте build context `.` у корені `ai-ae-labs`.
 
 Це навчальний однокористувацький сервіс без app-level авторизації, durable storage та платіжного API. Реєстр і сесії в пам'яті; не відкривайте його в загальнодоступну мережу. Cloud Run IAM обмежує викликачів сервісу, але не пов'язує довільний `userId` із людиною автоматично.
+
+---
+
+# Домашка 10.10.2026
+
+## Чотири curl-перевірки
+
+Спершу прогнав без Docker (`go run ./week2/Day4_Agent_as_Service_Deploy/labs4`),
+потім — ті самі чотири запити на контейнері. Відповіді однакові.
+
+```bash
+BASE=http://127.0.0.1:8080
+curl -i -fsS "$BASE/health"
+curl -i -fsS "$BASE/readyz"
+curl -i -fsS -X POST \
+  "$BASE/api/apps/first_graph_agent/users/learner/sessions/demo" \
+  -H 'Content-Type: application/json' -d '{}'
+curl -i -fsS -N "$BASE/api/run_sse" \
+  -H 'Content-Type: application/json' \
+  -d '{"appName":"first_graph_agent","userId":"learner","sessionId":"demo","newMessage":{"role":"user","parts":[{"text":"Мерчант A-114 просить повернення по транзакції txn-2026-07-118845"}]}}'
+```
+
+1. `/health` → `200 OK`, тіло `OK`.
+2. `/readyz` → `200 OK`, тіло `OK`.
+3. Створення сесії → `200`, `{"id":"demo","appName":"first_graph_agent",...}`.
+4. SSE → `200`, `Content-Type: text/event-stream`, три `data:`-події (`prepare` → `open_refund_case` → `format`), `state_delta` з `refund:last_case_id` і статусом `pending`.
+
+## Graceful shutdown — реальний SIGTERM, не лише тест
+
+```bash
+kill -TERM <pid>
+```
+
+Лог сервісу:
+
+```
+2026/10/10 20:49:19 ADK service listening at 127.0.0.1:8080 (no model credentials required)
+2026/10/10 20:49:32 draining: rejecting new work and waiting for active requests
+2026/10/10 20:49:32 ADK service drained and stopped
+```
+
+Той самий результат через `docker stop` (він і шле SIGTERM):
+
+```
+2026/10/10 19:09:28 ADK service listening at [::]:8080 (no model credentials required)
+2026/10/10 19:09:46 draining: rejecting new work and waiting for active requests
+2026/10/10 19:09:46 ADK service drained and stopped
+```
+
+Код виходу контейнера — `0` (перевірив `docker inspect --format '{{.State.ExitCode}}'`).
+
+## Тести з імеджем
+
+```bash
+docker build --platform linux/amd64 \
+  -f week2/Day4_Agent_as_Service_Deploy/labs4/Dockerfile \
+  -t ai-ae-lab4:week2 .
+```
+
+**Розмір: 17.1 MB** (`17120609` байт, `docker inspect --format '{{.Size}}'`),
+платформа `linux/amd64`. 
+
+```bash
+docker run --detach --read-only --cap-drop ALL \
+  -p 127.0.0.1:8080:8080 ai-ae-lab4:week2
+```
+
+```
+User: 65532:65532  ReadonlyRootfs: true
+```
