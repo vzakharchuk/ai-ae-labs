@@ -45,6 +45,7 @@ import (
 	"google.golang.org/adk/v2/agent"
 
 	"github.com/dimetron/ai-eng-course/labs/internal/labrun"
+	"github.com/dimetron/ai-eng-course/labs/week3/Day5_Lossless_PDF_Parsing_Chunking/labs5/internal/chunkeval"
 )
 
 // nodeCtx — суворий фейк agent.Context. Вбудований StrictContextMock означає:
@@ -180,27 +181,113 @@ func TestDoclingFixtureKeepsTables(t *testing.T) {
 
 // --- Вузол chunk -------------------------------------------------------------
 
-// TestChunk_Stub фіксує ПОТОЧНУ поведінку заглушки: один чанк на весь документ.
-//
-// TODO(студент): щойно ви реалізуєте Parent-Child chunking, цей тест має
-// впасти — і це правильно. Замініть його на перевірку вашої ієрархії:
-// скільки parents, скільки children, чи в кожного child заповнений ParentID
-// і SectionPath, чи Level зростає всередині розділу.
-func TestChunk_Stub(t *testing.T) {
+// TestChunk_TitleIsImplicitParent: один непронумерований заголовок (Depth 0,
+// назва документа) сам стає parent-чанком, а наступний блок — його дитиною.
+// Найменший випадок правила 1/2 з TODO в pipeline.go.
+func TestChunk_TitleIsImplicitParent(t *testing.T) {
 	t.Parallel()
 	got, err := chunk(newNodeCtx(), newDocument("d1", "", "# Розділ\n\nабзац\n"))
 	if err != nil {
 		t.Fatalf("chunk() error = %v", err)
 	}
-	if len(got.Chunks) != 1 {
-		t.Fatalf("заглушка має повертати 1 чанк, отримали %d — схоже, ви вже реалізували chunking; перепишіть цей тест", len(got.Chunks))
+	if len(got.Chunks) != 2 {
+		t.Fatalf("чанків = %d, очікували 2 (parent + 1 child)", len(got.Chunks))
 	}
-	if got.Chunks[0].ParentID != "" {
-		t.Errorf("ParentID кореневого чанка = %q, очікували порожній", got.Chunks[0].ParentID)
+	parent, child := got.Chunks[0], got.Chunks[1]
+	if parent.Level != 0 || parent.ParentID != "" || parent.Kind != "heading" {
+		t.Errorf("parent = %+v; очікували Level=0, ParentID=\"\", Kind=heading", parent)
 	}
-	if got.Chunks[0].DocumentID != "d1" {
-		t.Errorf("DocumentID = %q, очікували d1 — provenance втрачено", got.Chunks[0].DocumentID)
+	if child.Level != 2 || child.ParentID != parent.ID || child.Text != "абзац" {
+		t.Errorf("child = %+v; очікували Level=2, ParentID=%q, Text=\"абзац\"", child, parent.ID)
 	}
+	if got.Chunks[0].DocumentID != "d1" || got.Chunks[1].DocumentID != "d1" {
+		t.Errorf("DocumentID втрачено: %+v", got.Chunks)
+	}
+}
+
+// TestChunk_HierarchyAndSectionPath — основний контракт Parent-Child: нова
+// Depth-1 секція відкриває parent, Depth-2 підсекція лише оновлює SectionPath
+// (не створює власного чанка), а діти несуть повний шлях "верх / підрозділ".
+func TestChunk_HierarchyAndSectionPath(t *testing.T) {
+	t.Parallel()
+	md := "# Doc\n\n## 1 Scope\n\n### 1.1 Vendors\n\nтекст про вендорів\n\n## 2 Findings\n\nтекст про знахідки\n"
+	got, err := chunk(newNodeCtx(), newDocument("d2", "", md))
+	if err != nil {
+		t.Fatalf("chunk() error = %v", err)
+	}
+	// Doc(parent) → 1 Scope(parent) → "текст про вендорів"(child, 1 Scope / 1.1 Vendors) → 2 Findings(parent) → "текст про знахідки"(child, 2 Findings)
+	var parents, children int
+	bySectionPath := map[string]Chunk{}
+	for _, c := range got.Chunks {
+		if c.Level == 0 {
+			parents++
+			continue
+		}
+		children++
+		bySectionPath[c.SectionPath] = c
+	}
+	if parents != 3 {
+		t.Fatalf("parents = %d, очікували 3 (Doc, 1 Scope, 2 Findings)", parents)
+	}
+	if children != 2 {
+		t.Fatalf("children = %d, очікували 2", children)
+	}
+	vendors, ok := bySectionPath["1 Scope / 1.1 Vendors"]
+	if !ok {
+		t.Fatalf("немає child з SectionPath %q; маємо %v", "1 Scope / 1.1 Vendors", bySectionPath)
+	}
+	if vendors.Text != "текст про вендорів" {
+		t.Errorf("text = %q", vendors.Text)
+	}
+	findings, ok := bySectionPath["2 Findings"]
+	if !ok {
+		t.Fatalf("немає child з SectionPath %q (нова Depth-1 секція мала скинути subsection)", "2 Findings")
+	}
+	if findings.Text != "текст про знахідки" {
+		t.Errorf("text = %q", findings.Text)
+	}
+}
+
+// TestChunk_LongTextSplitsBySentence — правило 4: текстовий блок довший за
+// maxChildTokens розбивається на кілька children по межах речень, і жодне
+// речення не розрізається навпіл.
+func TestChunk_LongTextSplitsBySentence(t *testing.T) {
+	t.Parallel()
+	sentence := "Це одне тестове речення для вимірювання довжини тексту. "
+	long := strings.Repeat(sentence, 40) // довше за maxChildTokens=200
+	md := "# Doc\n\n" + long
+	got, err := chunk(newNodeCtx(), newDocument("d3", "", md))
+	if err != nil {
+		t.Fatalf("chunk() error = %v", err)
+	}
+	var children []Chunk
+	for _, c := range got.Chunks {
+		if c.Level == 2 {
+			children = append(children, c)
+		}
+	}
+	if len(children) < 2 {
+		t.Fatalf("children = %d, очікували розбиття на ≥2 — довгий текст не розрізано", len(children))
+	}
+	for _, c := range children {
+		if n := chunkeval.Tokens(c.Text); n > maxChildTokens {
+			t.Errorf("child на %d токенів перевищує maxChildTokens=%d: %q", n, maxChildTokens, c.Text)
+		}
+		if !strings.HasSuffix(strings.TrimSpace(c.Text), ".") {
+			t.Errorf("child не закінчується на межі речення: %q", c.Text)
+		}
+	}
+	if strings.Join(collectTexts(children), " ") != strings.TrimSpace(long) {
+		t.Errorf("розбиття загубило чи переставило текст")
+	}
+}
+
+func collectTexts(chunks []Chunk) []string {
+	out := make([]string, len(chunks))
+	for i, c := range chunks {
+		out[i] = c.Text
+	}
+	return out
 }
 
 func TestChunk_EmptyDocumentIsError(t *testing.T) {
@@ -215,11 +302,7 @@ func TestChunk_EmptyDocumentIsError(t *testing.T) {
 // Головна вимога тижня: жодна таблиця не може бути розрізана між двома
 // чанками. Тест перевіряє це напряму на реальному виході docling: кожна
 // таблиця — рівно один чанк Kind == "table", з усіма рядками й заголовком.
-//
-// TODO(студент): приберіть t.Skip, коли візьметесь за вузол chunk.
 func TestChunk_TableStaysWhole(t *testing.T) {
-	t.Skip("зніміть skip, коли реалізуєте Parent-Child chunking у pipeline.go")
-
 	data, err := os.ReadFile(fixtureDocMD)
 	if err != nil {
 		t.Fatal(err)
@@ -279,40 +362,151 @@ func firstTableRow(text string) string {
 
 // --- Вузли extract_entities / index_vector / index_graph ---------------------
 
-// TestStubNodesPassThrough фіксує заглушки: вузли повертають batch без змін.
-//
-// TODO(студент): замініть на табличні тести ваших вузлів — наприклад,
-// extract_entities знаходить Vendor "Acme Bank JSC" із SourceChunkID;
-// index_vector дає VectorsAdded == кількість children і st.Vector.Len() те
-// саме; index_graph не створює дублікатів (NodesAdded ≤ len(Entities)).
-func TestStubNodesPassThrough(t *testing.T) {
-	t.Parallel()
-	in := Batch{Chunks: []Chunk{{ID: "c1", Text: "Acme Bank JSC"}}}
-	st := NewStores()
-	nodes := map[string]func(agent.Context, Batch) (Batch, error){
-		"extract_entities": extractEntities,
-		"index_vector":     newIndexVector(st.Vector),
-		"index_graph":      newIndexGraph(st.Graph),
+// chunkedFixture ганяє load→chunk→extractEntities на реальній фікстурі, щоб
+// кожен тест нижче перевіряв вузол на справжніх даних, а не на одному
+// вигаданому чанку.
+func chunkedFixture(t *testing.T) Batch {
+	t.Helper()
+	data, err := os.ReadFile(fixtureMD)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for name, node := range nodes {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			got, err := node(newNodeCtx(), in)
-			if err != nil {
-				t.Fatalf("%s: %v", name, err)
-			}
-			if len(got.Chunks) != len(in.Chunks) {
-				t.Errorf("%s загубив чанки: %d → %d", name, len(in.Chunks), len(got.Chunks))
-			}
-		})
+	ctx := newNodeCtx()
+	batch, err := chunk(ctx, newDocument("ledgerworks_soc2", fixtureMD, string(data)))
+	if err != nil {
+		t.Fatalf("chunk() error = %v", err)
+	}
+	batch, err = extractEntities(ctx, batch)
+	if err != nil {
+		t.Fatalf("extractEntities() error = %v", err)
+	}
+	return batch
+}
+
+// TestExtractEntities_FindsKnownTypes перевіряє, що вузол реально читає
+// типізовані сутності з таблиць фікстури — Vendor з SourceChunkID на таблицю
+// вендорів, і що таблиця без жодної відомої колонки (0 рядків) не дає жодної
+// сутності, а не падає.
+func TestExtractEntities_FindsKnownTypes(t *testing.T) {
+	t.Parallel()
+	batch := chunkedFixture(t)
+
+	var acme *Entity
+	for i := range batch.Entities {
+		if batch.Entities[i].Type == "Vendor" && batch.Entities[i].Name == "Acme Bank JSC" {
+			acme = &batch.Entities[i]
+			break
+		}
+	}
+	if acme == nil {
+		t.Fatalf("Vendor %q не знайдено серед %d сутностей", "Acme Bank JSC", len(batch.Entities))
+	}
+	if acme.ID != "vendor:acme-bank-jsc" {
+		t.Errorf("ID = %q, очікували стабільний %q", acme.ID, "vendor:acme-bank-jsc")
+	}
+	if acme.SourceChunkID == "" {
+		t.Error("SourceChunkID порожній — provenance втрачено")
+	}
+
+	empty, err := extractEntities(newNodeCtx(), Batch{Chunks: []Chunk{
+		{ID: "t1", Kind: "table", Text: "| # | Description |\n|---|---|\n| 1 | щось |"},
+	}})
+	if err != nil {
+		t.Fatalf("extractEntities(невідома таблиця) error = %v", err)
+	}
+	if len(empty.Entities) != 0 {
+		t.Errorf("таблиця без відомих колонок дала %d сутностей, очікували 0", len(empty.Entities))
+	}
+}
+
+// TestIndexVector_ChildrenOnly: TODO прямо каже — VectorsAdded == кількість
+// children (ParentID != ""), parents не індексуються, і st.Vector.Len()
+// узгоджений з VectorsAdded.
+func TestIndexVector_ChildrenOnly(t *testing.T) {
+	t.Parallel()
+	batch := chunkedFixture(t)
+	wantChildren := 0
+	for _, c := range batch.Chunks {
+		if c.ParentID != "" {
+			wantChildren++
+		}
+	}
+
+	st := NewStores()
+	got, err := newIndexVector(st.Vector)(newNodeCtx(), batch)
+	if err != nil {
+		t.Fatalf("index_vector error = %v", err)
+	}
+	if got.VectorsAdded != wantChildren {
+		t.Errorf("VectorsAdded = %d, очікували %d (кількість children)", got.VectorsAdded, wantChildren)
+	}
+	if st.Vector.Len() != wantChildren {
+		t.Errorf("st.Vector.Len() = %d, очікували %d", st.Vector.Len(), wantChildren)
+	}
+}
+
+// TestIndexGraph_DedupesAndLinksSameRow: NodesAdded ≤ len(Entities) (дублі
+// Vendor у двох таблицях не створюють два вузли), і ребро Vendor→Finding
+// реально з'являється для сутностей одного рядка таблиці знахідок.
+func TestIndexGraph_DedupesAndLinksSameRow(t *testing.T) {
+	t.Parallel()
+	batch := chunkedFixture(t)
+	if len(batch.Entities) == 0 {
+		t.Fatal("фікстура не дала жодної сутності — перевірте extractEntities")
+	}
+
+	st := NewStores()
+	got, err := newIndexGraph(st.Graph)(newNodeCtx(), batch)
+	if err != nil {
+		t.Fatalf("index_graph error = %v", err)
+	}
+	if got.NodesAdded <= 0 || got.NodesAdded > len(batch.Entities) {
+		t.Errorf("NodesAdded = %d, очікували 0 < n ≤ %d (дублі злиті)", got.NodesAdded, len(batch.Entities))
+	}
+
+	node, ok := st.Graph.Node("vendor:acme-bank-jsc")
+	if !ok {
+		t.Fatal("вузол vendor:acme-bank-jsc не знайдено")
+	}
+	if len(node.Sources) < 2 {
+		t.Errorf("Sources = %v; Acme згадується у двох таблицях, provenance мав злитись", node.Sources)
+	}
+
+	findings := st.Graph.Neighbors("vendor:acme-bank-jsc", "has_finding")
+	if len(findings) == 0 {
+		t.Fatal("немає жодного ребра vendor:acme-bank-jsc -has_finding-> *")
+	}
+	var gotF101 bool
+	for _, f := range findings {
+		if f.ID == "finding:f-101" {
+			gotF101 = true
+		}
+	}
+	if !gotF101 {
+		t.Errorf("серед сусідів немає finding:f-101: %v", findings)
 	}
 }
 
 // --- Вузол report ------------------------------------------------------------
 
-// TODO(студент): за Homework п.5 report має друкувати статистику за рівнями,
-// розміри (min/avg/max) і `Tables: K/K preserved`. Розширте таблицю кейсів,
-// коли реалізуєте це.
+// TestReport_RealFixture перевіряє саме той рядок, який потрібен Homework
+// п.5 на справжніх даних: усі 3 таблиці фікстури цілі (Tables: 3/3), і
+// кількість parents/children збігається з TestChunk_HierarchyAndSectionPath
+// (5 parents, 10 children — лічилось незалежно тим самим документом).
+func TestReport_RealFixture(t *testing.T) {
+	t.Parallel()
+	batch := chunkedFixture(t)
+	got, err := report(newNodeCtx(), batch)
+	if err != nil {
+		t.Fatalf("report() error = %v", err)
+	}
+	for _, want := range []string{"5 parents", "10 children", "Tables: 3/3 preserved"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report() = %q; немає підрядка %q", got, want)
+		}
+	}
+}
+
 func TestReport(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -352,8 +546,12 @@ func TestGraph_EarlyWin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !strings.Contains(res.Final, "Отримано 1 чанків") {
-		t.Errorf("фінальна відповідь = %q; очікували рядок вузла report", res.Final)
+	// 15 = 5 parents (Doc, 1 Scope, 2 Findings, 3 Tariffs and Signers,
+	// 4 Conclusion) + 10 children — рахунок зафіксовано в
+	// TestChunk_HierarchyAndSectionPath, тут перевіряємо лише що report
+	// бачить саме цей Batch, а не щось втрачене графом по дорозі.
+	if !strings.Contains(res.Final, "Отримано 15 чанків") {
+		t.Errorf("фінальна відповідь = %q; очікували рядок вузла report із 15 чанками", res.Final)
 	}
 	// 7 вузлів після Start — 7 подій: жоден вузол не випав із ланцюжка.
 	if got := len(res.Events); got != 7 {
