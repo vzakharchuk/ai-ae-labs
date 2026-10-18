@@ -56,7 +56,11 @@ func newTestRetriever(t *testing.T) *retriever {
 	if err != nil {
 		t.Fatalf("корпус: %v", err)
 	}
-	return newRetriever(chunks, &embed.Client{}) // чистий Go: детермінований стаб, без мережі
+	r, err := newRetriever(chunks, &embed.Client{}) // чистий Go: детермінований стаб, без мережі
+	if err != nil {
+		t.Fatalf("newRetriever: %v", err)
+	}
+	return r
 }
 
 // --- Вузол search ------------------------------------------------------------
@@ -130,6 +134,33 @@ func TestPipeline_EarlyWin(t *testing.T) {
 		if !strings.Contains(res.Final, want) {
 			t.Errorf("у відповіді немає %q:\n%s", want, res.Final)
 		}
+	}
+}
+
+// TestPipeline_MultiHop — КОНТРАКТ ДЗ (п.2, 10 балів): канонічний запит
+// Оксани. Відповідь має містити ОБИДВА факти — хто з мерчантів на T-2, і
+// хто підписував їхні договори — кожен зі своєю цитатою (chunk_id,
+// document_id), і НЕ містити сигнатуру контракту CT-2025-007 (T-1, не
+// відповідає запиту — це перевірка на забруднення з graph_traversal, що
+// обходить увесь граф Contract→Signer без фільтру по тарифу).
+func TestPipeline_MultiHop(t *testing.T) {
+	t.Parallel()
+	a, err := newGraph(newTestRetriever(t))
+	if err != nil {
+		t.Fatalf("newGraph: %v", err)
+	}
+	res, err := labrun.Run(context.Background(), a,
+		"які мерчанти на тарифі T-2 підпадають під вимогу НБУ 2026 і хто підписував їхні договори?")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	for _, want := range []string{"A-114", "A-207", "Олег Мельник", "Ірина Бойко", "c-sign-014", "c-sign-031"} {
+		if !strings.Contains(res.Final, want) {
+			t.Errorf("у multi-hop відповіді немає %q:\n%s", want, res.Final)
+		}
+	}
+	if strings.Contains(res.Final, "CT-2025-007") {
+		t.Errorf("multi-hop відповідь згадує CT-2025-007 (тариф T-1, не відповідає запиту про T-2):\n%s", res.Final)
 	}
 }
 
@@ -213,8 +244,6 @@ func TestCache_ConcurrentAccess(t *testing.T) {
 // hit-rate без виміряного false-positive rate — це не перемога, а регресія
 // якості («кеш — це межа безпеки»).
 func TestCache_ParaphraseHits(t *testing.T) {
-	t.Skip("зніміть skip, коли реалізуєте семантичний кеш замість точного map-lookup")
-
 	r := newTestRetriever(t)
 	ctx := newNodeCtx()
 
@@ -232,6 +261,95 @@ func TestCache_ParaphraseHits(t *testing.T) {
 	}
 	if !para.CacheHit {
 		t.Errorf("перефразований запит не влучив у семантичний кеш")
+	}
+}
+
+// TestCache_RejectsDifferentTariff — КОНТРАКТ ДЗ (частина п.4, 10 балів):
+// high hit-rate без виміряного false-positive rate — це регресія, не
+// перемога. Запит про T-1 не повинен отримати відповідь, закешовану під T-2,
+// хоча речення відрізняються лише одним токеном і будь-яка з двох метрик
+// (cosine на реальному embeddinggemma, лексичний stem-overlap) оцінює цю
+// пару так само високо, як справжнє перефразування — виміряно окремо, див.
+// retrieval.go, коментар до codesConflict і semanticCacheThreshold.
+func TestCache_RejectsDifferentTariff(t *testing.T) {
+	r := newTestRetriever(t)
+	ctx := newNodeCtx()
+
+	t2, err := r.search(ctx, "яка ставка комісії на тарифі T-2?")
+	if err != nil {
+		t.Fatalf("search T-2: %v", err)
+	}
+	if _, err := r.answer(ctx, t2); err != nil {
+		t.Fatalf("answer T-2: %v", err)
+	}
+
+	t1, err := r.search(ctx, "яка ставка комісії на тарифі T-1?")
+	if err != nil {
+		t.Fatalf("search T-1: %v", err)
+	}
+	if t1.CacheHit {
+		t.Errorf("запит про T-1 влучив у кеш, закешований під T-2 — false positive: %q", t1.Candidates[0].Text)
+	}
+}
+
+// TestCache_RejectsDifferentHopShape — другий, реально виміряний
+// false-positive (той самий тариф, різна форма запиту): "яка ставка на
+// T-2?" (один факт) і канонічний multi-hop запит про T-2 (два факти)
+// згадують один і той самий код — codesConflict тут не спрацює — але
+// embeddinggemma дає їм cosine 0.51, вище semanticCacheThreshold (0.45),
+// бо обидва про T-2 і написані схожими словами (виміряно окремо, не
+// вгадано; retrieval.go, answerCache.get). Без окремого guard на форму
+// запиту multi-hop запит отримав би однофактну відповідь і втратив
+// підписантів.
+func TestCache_RejectsDifferentHopShape(t *testing.T) {
+	r := newTestRetriever(t)
+	ctx := newNodeCtx()
+
+	rate, err := r.search(ctx, "яка ставка комісії на тарифі T-2?")
+	if err != nil {
+		t.Fatalf("search (single-hop): %v", err)
+	}
+	if _, err := r.answer(ctx, rate); err != nil {
+		t.Fatalf("answer (single-hop): %v", err)
+	}
+
+	multiHop, err := r.search(ctx, "які мерчанти на тарифі T-2 підпадають під вимогу НБУ 2026 і хто підписував їхні договори?")
+	if err != nil {
+		t.Fatalf("search (multi-hop): %v", err)
+	}
+	if multiHop.CacheHit {
+		t.Errorf("multi-hop запит про T-2 влучив у кеш, закешований для single-hop запиту про той самий T-2 — false positive: %q",
+			multiHop.Candidates[0].Text)
+	}
+}
+
+// TestCache_RejectsDifferentEntity — третій реально виміряний false
+// positive: "хто підписав договір мерчанта A-114?" (код a-114) і канонічний
+// запит про T-2 (код t-2) — РІЗНІ ПРЕФІКСИ, не "той самий тип, інше
+// значення" (codesConflict спершу ловив лише це вужче правило). Обидва
+// multiHop=true (не впаде на TestCache_RejectsDifferentHopShape), обидва —
+// про щось із того самого мікро-домену мерчант/тариф/підписант, і
+// embeddinggemma дав достатньо високий cosine, щоб точне правило без
+// перевірки кодів дало хибний hit.
+func TestCache_RejectsDifferentEntity(t *testing.T) {
+	r := newTestRetriever(t)
+	ctx := newNodeCtx()
+
+	a114, err := r.search(ctx, "хто підписав договір мерчанта A-114?")
+	if err != nil {
+		t.Fatalf("search (A-114): %v", err)
+	}
+	if _, err := r.answer(ctx, a114); err != nil {
+		t.Fatalf("answer (A-114): %v", err)
+	}
+
+	t2, err := r.search(ctx, "які мерчанти на тарифі T-2 підпадають під вимогу НБУ 2026 і хто підписував їхні договори?")
+	if err != nil {
+		t.Fatalf("search (T-2): %v", err)
+	}
+	if t2.CacheHit {
+		t.Errorf("запит про T-2 влучив у кеш, закешований для запиту про мерчанта A-114 — false positive: %q",
+			t2.Candidates[0].Text)
 	}
 }
 
@@ -285,8 +403,6 @@ func TestBaseline_ConfusesTariffs(t *testing.T) {
 // із цього тесту можна одразу класти в README — це один із п'яти потрібних
 // прикладів.
 func TestRerank_ChangesOrder(t *testing.T) {
-	t.Skip("зніміть skip, коли реалізуєте re-ranker у retrieval.go")
-
 	in := SearchResult{Query: "яка ставка комісії на тарифі T-2?", Candidates: []Candidate{
 		{ChunkID: "c-A331-rate", DocumentID: "ledgerworks_soc2", Text: "Мерчант A-331 обслуговується за тарифом T-1, ставка комісії 1.8 %.", Score: 0.88},
 		{ChunkID: "c-A114-rate", DocumentID: "ledgerworks_soc2", Text: "Мерчант A-114 обслуговується за тарифом T-2, ставка комісії 2.9 %.", Score: 0.86},

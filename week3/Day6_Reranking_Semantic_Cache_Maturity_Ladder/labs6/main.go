@@ -38,7 +38,11 @@ func main() {
 	}
 	emb := embed.New()
 	log.Printf("embeddings: %s", emb.Name())
-	wa, err := newGraph(newRetriever(chunks, emb))
+	r, err := newRetriever(chunks, emb)
+	if err != nil {
+		log.Fatalf("failed to create retriever: %v", err)
+	}
+	wa, err := newGraph(r)
 	if err != nil {
 		log.Fatalf("failed to create workflow: %v", err)
 	}
