@@ -119,15 +119,30 @@ func (e *endless) NextStep(context.Context, react.History) (react.Step, error) {
 }
 
 func TestRunStopsAtIterationLimit(t *testing.T) {
-	t.Skip("прибрати, коли Run реалізовано")
 	_, _, err := Run(context.Background(), &endless{}, ledger.New().Tools(), "task", react.Budget{MaxIterations: 5})
 	if !errors.Is(err, ErrMaxIterations) {
 		t.Fatalf("err = %v; want errors.Is(err, ErrMaxIterations)", err)
 	}
 }
 
+// TestGraphStopsAtIterationLimit — чекліст ДЗ: "тест із планувальником, що
+// ніколи не завершує, зупиняється за maxIterations з явною помилкою". Той
+// самий endless, що й для react.go, тільки через NewGraphAgent + labrun —
+// перевіряє, що ErrMaxIterations доходить до верху крізь обгортки
+// RunNode/labrun (fmt.Errorf("...: %w", ...) на кожному рівні, тому
+// errors.Is все ще працює).
+func TestGraphStopsAtIterationLimit(t *testing.T) {
+	a, err := NewGraphAgent(&endless{}, ledger.New().Tools(), react.Budget{MaxIterations: 5})
+	if err != nil {
+		t.Fatalf("NewGraphAgent: %v", err)
+	}
+	_, runErr := labrun.Run(context.Background(), a, "task")
+	if !errors.Is(runErr, ErrMaxIterations) {
+		t.Fatalf("err = %v; want errors.Is(err, ErrMaxIterations)", runErr)
+	}
+}
+
 func TestRunKeepsObservationsInCallOrder(t *testing.T) {
-	t.Skip("прибрати, коли Run реалізовано")
 	_, tr, err := Run(context.Background(), &react.RulePlanner{}, ledger.New().Tools(), "task", react.Budget{})
 	if err != nil {
 		t.Fatal(err)

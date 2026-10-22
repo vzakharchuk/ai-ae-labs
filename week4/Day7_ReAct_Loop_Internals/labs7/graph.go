@@ -23,9 +23,26 @@ type StepResult struct {
 }
 
 // NewGraphAgent збирає агента Start → react_loop.
+//
+// plan_step — NewFunctionNode: типізований вхід/вихід, event log, schema-
+// валідація — усе від рушія. Але RunNode повертає лише StepResult (те, що
+// призначене для event log — Iteration/Thought/кількість Calls/Final), а
+// orchestrator-у нижче потрібен ПОВНИЙ react.Step (самі ToolCall з іменами й
+// аргументами, Answer). lastStep — closure-змінна, якою крок передає його
+// orchestrator-у в тому самому раунді; RunNode блокує до завершення дитини,
+// тож до наступного читання lastStep нічого іншого його не перезапише.
+//
+// Застереження, чесно: history і lastStep — мутабельний стан, зафіксований у
+// closure НАВКОЛО одного агента, не в ctx.State() ADK. Для одного CLI-рану
+// (go run . graph console) це безпечно: NewGraphAgent викликається раз на
+// процес. Якщо той самий *agent.Agent віддати в `web`-режим і він
+// обслуговуватиме кілька паралельних розмов — вони поділять ці змінні й
+// переплутають історії. Виправлення — те саме ctx.State()/session, що й у
+// решти ADK-вузлів, поза обсягом цього ДЗ.
 func NewGraphAgent(p react.Planner, reg react.Registry, b react.Budget) (agent.Agent, error) {
 	b = b.Normalized()
-	history := react.Seed("")
+	var history react.History
+	var lastStep react.Step
 
 	step := workflow.NewFunctionNode("plan_step",
 		func(ctx agent.Context, turn int) (StepResult, error) {
@@ -33,7 +50,7 @@ func NewGraphAgent(p react.Planner, reg react.Registry, b react.Budget) (agent.A
 			if err != nil {
 				return StepResult{}, err
 			}
-			// TODO(студент): збережіть s, щоб цикл нижче міг виконати s.Calls.
+			lastStep = s
 			return StepResult{Iteration: turn, Thought: s.Thought, Calls: len(s.Calls), Final: s.Final}, nil
 		}, workflow.NodeConfig{})
 
@@ -41,21 +58,23 @@ func NewGraphAgent(p react.Planner, reg react.Registry, b react.Budget) (agent.A
 		func(ctx agent.Context, task string, _ func(*session.Event) error) (string, error) {
 			history = react.Seed(task)
 			for i := 1; ; i++ {
-				// TODO(студент): ліміт — той самий текст помилки й той самий ErrMaxIterations, що в react.go.
 				if i > b.MaxIterations {
 					return "", fmt.Errorf("вичерпано ліміт %d ітерацій: %w", b.MaxIterations, ErrMaxIterations)
 				}
-				r, err := workflow.RunNode[StepResult](ctx, step, i)
-				if err != nil {
+				if _, err := workflow.RunNode[StepResult](ctx, step, i); err != nil {
 					return "", fmt.Errorf("ітерація %d: %w", i, err)
 				}
-				if r.Final {
-					// TODO(студент): поверніть справжню відповідь кроку, а не думку.
-					return r.Thought, nil
+
+				s := lastStep
+				if s.Final {
+					return s.Answer, nil
 				}
-				// TODO(студент): виконайте виклики кроку (reg.Invoke) і дайте
-				// history = history.Append(step, observations).
-				_ = reg
+
+				observations := make([]react.Observation, 0, len(s.Calls))
+				for _, call := range s.Calls {
+					observations = append(observations, reg.Invoke(ctx, call))
+				}
+				history = history.Append(s, observations)
 			}
 		}, workflow.NodeConfig{})
 
