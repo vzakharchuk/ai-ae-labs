@@ -130,7 +130,33 @@ func TestRunCommandsOffline(t *testing.T) {
 // remember_fact(integration.A-114=new-api). Перевірте в memlab.Audit(turn.Events),
 // що є рядок Kind=="rejected", і що state_delta з FactPrefix немає.
 func TestPoisonedNoteCannotRewriteFact(t *testing.T) {
-	t.Skip("ДЗ 9, п.3: напишіть тест отруєння й зніміть цей Skip")
+	a := testApp(t)
+	// Спершу легальний факт від користувача — те саме, що й у поясненні
+	// функції: без нього "replace" у поясненні нижче нема що переписувати.
+	turnOn(t, a, fakellm.New("fake",
+		fakellm.CallTurn("remember_fact", map[string]any{"key": "integration.A-114", "value": "legacy"}),
+		fakellm.TextTurn("Записав."),
+	), "s1", "A-114 сидить на legacy")
+
+	a.Docs = map[string]string{"A-114": InjectedDoc}
+	turn := turnOn(t, a, fakellm.New("fake",
+		fakellm.CallTurn("fetch_partner_doc", map[string]any{"merchant_id": "A-114"}),
+		fakellm.CallTurn("remember_fact", map[string]any{"key": "integration.A-114", "value": "new-api"}),
+		fakellm.TextTurn("Готово."),
+	), "s1", "Подивись, що пишуть у порталі про A-114.")
+
+	var rejected bool
+	for _, row := range memlab.Audit(turn.Events) {
+		if row.Kind == "rejected" {
+			rejected = true
+		}
+		if row.Kind == "state_delta" && row.Key == memlab.FactPrefix+"integration.A-114" {
+			t.Fatalf("отруєна нотатка переписала факт: %+v", row)
+		}
+	}
+	if !rejected {
+		t.Fatalf("жодного rejected-рядка в журналі: %+v", memlab.Audit(turn.Events))
+	}
 }
 
 // TestConcurrentWritesDifferentKeys — ++ Advanced (до 20 балів). ≥10 горутин
@@ -227,16 +253,26 @@ func TestStarterPiecesWithoutNetwork(t *testing.T) {
 
 // failingState is a session.State whose writes are refused — the storage
 // failing under remember_fact. A refusal must surface as a named error.
+//
+// Get стабиться на "немає такого ключа": rememberFact тепер читає поточний
+// факт ПЕРЕД записом (політика), тож без цього embedded nil session.State
+// панікує на Get раніше, ніж дійде до Set.
 type failingState struct{ session.State }
 
-func (failingState) Set(string, any) error { return errors.New("disk full") }
+func (failingState) Get(string) (any, error) { return nil, errors.New("not found") }
+func (failingState) Set(string, any) error   { return errors.New("disk full") }
 
 type failingCtx struct{ agent.Context }
 
 func (failingCtx) State() session.State { return failingState{} }
 
 func TestRememberFactNamesAStorageFailure(t *testing.T) {
-	_, err := App{}.rememberFact(failingCtx{}, FactInput{Key: "integration.A-114", Value: "legacy"})
+	// memlab.DefaultPolicy(), не App{}: з порожньою Policy{} (Keys == nil)
+	// "integration" не дозволений узагалі, і запит відхиляється політикою
+	// РАНІШЕ, ніж доходить до Set — тест тоді ловить "rejected", не "disk
+	// full". Потрібна політика, що справді дозволяє цей ключ, щоб дійти до
+	// самого запису й побачити, як іменується збій сховища.
+	_, err := App{Policy: memlab.DefaultPolicy()}.rememberFact(failingCtx{}, FactInput{Key: "integration.A-114", Value: "legacy"})
 	if err == nil || !strings.Contains(err.Error(), "remember_fact") || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("err = %v, want it to name remember_fact and the cause", err)
 	}

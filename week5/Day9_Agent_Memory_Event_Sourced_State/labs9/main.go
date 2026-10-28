@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/adk/v2/model"
@@ -34,7 +35,8 @@ import (
 	"github.com/dimetron/ai-eng-course/labs/week5/Day9_Agent_Memory_Event_Sourced_State/labs9/internal/memlab"
 )
 
-// user is the support lead whose memory the lab builds.
+// user is the support lead whose memory the lab builds; -user overrides it
+// for the "another user does not see the fact" contrast (Homework п.1).
 const user = "iryna"
 
 // resolveModel is a variable so a test can swap the network for a scripted model.
@@ -67,6 +69,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	dbPath := fs.String("db", memlab.DefaultPath, "SQLite-файл сесій і пам'яті")
 	threshold := fs.Int("threshold", 0, "поріг токенів для компакції (tail retention); 0 — вимкнено")
 	offline := fs.Bool("offline", false, "не шукати провайдера, використати правилову модель")
+	userFlag := fs.String("user", user, "користувач, чиєю пам'яттю оперувати (контраст: інший -user на тій самій -db не бачить фактів)")
+	audit := fs.String("audit", "", "шлях для журналу say-ходу (audit_<user>_<сесія>.json, якщо порожньо)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -92,26 +96,27 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		if len(rest) < 3 {
 			return errors.New("say <сесія> <текст>")
 		}
-		return say(ctx, out, m, app, *threshold, rest[1], strings.Join(rest[2:], " "))
+		return say(ctx, out, m, app, *threshold, *userFlag, rest[1], strings.Join(rest[2:], " "), resolveAuditPath(*audit, *dbPath, *userFlag, rest[1]))
 	case "facts":
 		if len(rest) != 2 {
 			return errors.New("facts <сесія>")
 		}
-		return facts(ctx, out, app, rest[1])
+		return facts(ctx, out, app, *userFlag, rest[1])
 	case "poison":
 		app.Docs = map[string]string{"A-114": InjectedDoc}
-		if err := say(ctx, out, m, app, *threshold, "poison", "Подивись, що пишуть у порталі про A-114."); err != nil {
+		if err := say(ctx, out, m, app, *threshold, *userFlag, "poison", "Подивись, що пишуть у порталі про A-114.", resolveAuditPath(*audit, *dbPath, *userFlag, "poison")); err != nil {
 			return err
 		}
-		return facts(ctx, out, app, "poison")
+		return facts(ctx, out, app, *userFlag, "poison")
 	default:
 		return fmt.Errorf("невідома команда %q", rest[0])
 	}
 }
 
 // say runs one turn and prints the model answer plus the state changes the
-// turn left in the event log.
-func say(ctx context.Context, out io.Writer, m model.LLM, app App, threshold int, sid, text string) error {
+// turn left in the event log. It also writes the audit log of the STORED
+// session (Homework п.4) — audit_<user>_<sid>.json unless auditPath is set.
+func say(ctx context.Context, out io.Writer, m model.LLM, app App, threshold int, uid, sid, text, auditPath string) error {
 	ag, err := newAgent(m, app)
 	if err != nil {
 		return err
@@ -125,7 +130,7 @@ func say(ctx context.Context, out io.Writer, m model.LLM, app App, threshold int
 		return err
 	}
 	fmt.Fprintf(out, "[%s] > %s\n", sid, text)
-	t, err := memlab.Say(ctx, r, user, sid, text)
+	t, err := memlab.Say(ctx, r, uid, sid, text)
 	if err != nil {
 		return err
 	}
@@ -133,12 +138,36 @@ func say(ctx context.Context, out io.Writer, m model.LLM, app App, threshold int
 		fmt.Fprintf(out, "      [ev:%s] %s %s\n", row.Kind, row.Key, row.Detail)
 	}
 	fmt.Fprintf(out, "[%s] < %s\n", sid, t.Text)
+	if calls := app.Meter.Calls(); len(calls) > 0 {
+		c := calls[len(calls)-1]
+		fmt.Fprintf(out, "      [ev:tokens] prompt=%d output=%d facts=%d(kept=%d,dropped=%d) reported=%v\n",
+			c.PromptTokens, c.OutputTokens, c.FactsTokens, c.FactsKept, c.FactsDropped, c.ReportedUsage)
+	}
+
+	stored, err := memlab.StoredEvents(ctx, app.Store.Sessions, AppName, uid, sid)
+	if err != nil {
+		return fmt.Errorf("say: audit: %w", err)
+	}
+	if err := memlab.WriteAudit(auditPath, memlab.Audit(stored)); err != nil {
+		return fmt.Errorf("say: %w", err)
+	}
 	return nil
 }
 
+// resolveAuditPath picks where say writes the per-turn audit log: explicit
+// -audit wins; otherwise it sits NEXT TO the database file, not in the
+// current directory — so `go test` (which passes -db under t.TempDir())
+// never leaks audit_*.json into the repo working tree.
+func resolveAuditPath(explicit, dbPath, uid, sid string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return filepath.Join(filepath.Dir(dbPath), fmt.Sprintf("audit_%s_%s.json", uid, sid))
+}
+
 // facts prints the durable user: facts visible from a session.
-func facts(ctx context.Context, out io.Writer, app App, sid string) error {
-	got, err := app.Store.Sessions.Get(ctx, &session.GetRequest{AppName: AppName, UserID: user, SessionID: sid})
+func facts(ctx context.Context, out io.Writer, app App, uid, sid string) error {
+	got, err := app.Store.Sessions.Get(ctx, &session.GetRequest{AppName: AppName, UserID: uid, SessionID: sid})
 	if err != nil {
 		return fmt.Errorf("facts: %w", err)
 	}
