@@ -19,7 +19,18 @@
 package main
 
 import (
+	"context"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/workflowagent"
+	"google.golang.org/adk/v2/workflow"
+
+	"github.com/dimetron/ai-eng-course/labs/internal/labrun"
+	"github.com/dimetron/ai-eng-course/labs/week5/Day10_Collaboration_Agents_HITL/labs10/internal/approvals"
 )
 
 // TestJoinNodeWaitsForAllBranches — ДЗ 10, п.2 (fan-out / fan-in, 20 балів).
@@ -29,46 +40,151 @@ import (
 // помилка — перелічити не всіх, і тоді граф тихо йде далі з неповним
 // входом.
 //
-// Каркас: зібрати граф із двох гілок, прогнати, перевірити, що вхід
-// JoinNode містить обидва ключі. Зразок топології —
-// samples/adk/adk-go/examples/workflow/complex/main.go, рядки 221/230/231.
+// Каркас: мінімальний граф із двох гілок (не весь engine.go — щоб помилка
+// в НАШІЙ топології не змінювала сенс цього тесту), перевіряє, що merge
+// бачить ОБИДВА ключі.
 func TestJoinNodeWaitsForAllBranches(t *testing.T) {
-	t.Skip("ДЗ 10, п.2: перевірте, що JoinNode чекає на всі гілки, і зніміть цей Skip")
+	a := workflow.NewFunctionNode("a", func(_ agent.Context, _ string) (string, error) { return "A", nil }, workflow.NodeConfig{})
+	b := workflow.NewFunctionNode("b", func(_ agent.Context, _ string) (string, error) { return "B", nil }, workflow.NodeConfig{})
+	join := workflow.NewJoinNode("join")
+	var got map[string]any
+	collect := workflow.NewFunctionNode("collect", func(_ agent.Context, in map[string]any) (string, error) {
+		got = in
+		return "ok", nil
+	}, workflow.NodeConfig{})
+
+	eb := workflow.NewEdgeBuilder()
+	eb.AddFanOut(workflow.Start, a, b)
+	eb.AddFanIn(join, a, b)
+	eb.Add(join, collect)
+
+	ag, err := workflowagent.New(workflowagent.Config{Name: "join_test", Edges: eb.Build()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := labrun.Run(context.Background(), ag, "go"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["a"]; !ok {
+		t.Error("merge не бачив гілку \"a\" — JoinNode активувався до того, як вона відзвітувала")
+	}
+	if _, ok := got["b"]; !ok {
+		t.Error("merge не бачив гілку \"b\" — JoinNode активувався до того, як вона відзвітувала")
+	}
+	if len(got) != 2 {
+		t.Errorf("merge отримав %d ключів, want 2: %v", len(got), got)
+	}
 }
 
 // TestSpecialistFailureDoesNotCorruptTheAnswer — ДЗ 10, п.6 (containment).
 //
-// Що довести: збій одного спеціаліста стає ВИДИМИМ структурованим
-// результатом (status=unverified + код помилки), а не зникає під
-// правдоподібним абзацом координатора. Це рівно той рядок логу з
-// холодного відкриття: risk_desk status=error code=CRM_TIMEOUT.
-//
-// Сильна форма твердження: перед відправкою неперевірений розділ має
-// БЛОКУВАТИ approve. Тест, який лише перевіряє, що помилка десь
-// залогована, цього не доводить.
+// Сильна форма твердження: навіть якщо людина СХВАЛИЛА, документ з
+// неперевіреним розділом не відправляється. decideSend (gate.go) — чиста
+// функція, яку перевіряємо напряму, без збирання графа.
 func TestSpecialistFailureDoesNotCorruptTheAnswer(t *testing.T) {
-	t.Skip("ДЗ 10, п.6: доведіть, що unverified-розділ блокує approve, і зніміть цей Skip")
+	store, err := approvals.Open(filepath.Join(t.TempDir(), "board.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	doc := Document{Sections: []Section{
+		{Node: "risk_desk", Status: "verified", Findings: []Finding{{Claim: "ок", Source: "x"}}},
+		{Node: "integration_desk", Status: "unverified", Error: ErrIntegrationDeskDown.Error()},
+	}}
+	doc.Hash = hashDocument(doc)
+
+	in := GateDecision{Doc: doc, ID: "a", Status: approvals.Approved, By: "oksana"}
+	out, err := decideSend(context.Background(), store, in)
+	if err != nil {
+		t.Fatalf("decideSend: %v", err)
+	}
+	if !strings.Contains(out, "ВІДМОВЛЕНО") || !strings.Contains(out, "integration_desk") {
+		t.Fatalf("approved-але-unverified мало бути блоковано з названою причиною, отримали: %q", out)
+	}
+
+	// Контроль: той самий механізм, усі розділи verified — має пройти.
+	// decideSend(Approved) викликає store.Spend, а Spend вимагає реального
+	// запису в журналі (Ask + Decide), не лише значення Status у GateDecision
+	// — та сама перевірка, що в продакшн-коді: approve "з повітря" не існує.
+	clean := Document{Sections: []Section{
+		{Node: "risk_desk", Status: "verified", Findings: []Finding{{Claim: "ок", Source: "x"}}},
+		{Node: "integration_desk", Status: "verified", Findings: []Finding{{Claim: "ок2", Source: "y"}}},
+	}}
+	clean.Hash = hashDocument(clean)
+	if _, err := store.Ask(context.Background(), approvals.Request{
+		InterruptID: "b", SessionID: "s1", Action: "send_plan_to_board", ArtifactURI: "memo://x",
+		Hash: clean.Hash, Recipients: []string{"oksana@ledgerworks.ua", "board@ledgerworks.ua"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Decide(context.Background(), "b", approvals.Decision{Status: approvals.Approved, By: "oksana"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err = decideSend(context.Background(), store, GateDecision{Doc: clean, ID: "b", Status: approvals.Approved, By: "oksana"})
+	if err != nil {
+		t.Fatalf("decideSend(clean): %v", err)
+	}
+	if !strings.Contains(out, "ВІДПРАВЛЕНО") {
+		t.Errorf("повністю verified документ мав пройти, отримали: %q", out)
+	}
 }
 
-// TestApprovalTimeoutMeansRefusal — ДЗ 10, п.7 (вікно рішення, 5 балів).
+// TestApprovalTimeoutMeansRefusal — ДЗ 10, п.4 (вікно рішення, 5 балів).
 //
-// Що довести: мовчання протягом вікна рішення — це ВІДМОВА, і відмова з
-// названою причиною. Затвор, який чекає вічно, — не затвор, а зависла
-// задача: дія не сталася, і ніхто про це не дізнався.
-//
-// Каркас: відкрити канал відповідей, у який ніхто ніколи не напише, дати
-// коротке вікно (десятки мілісекунд — тест не має тривати 2 хвилини) і
-// вимагати відмови. Перевіряти причину через errors.Is, а не порівнянням
-// рядків.
-//
-// Чотири шляхи мають вести у відмову, кожен зі СВОЄЮ причиною: таймаут,
-// скасований контекст, закритий канал, нерозпізнане слово. «Людина
-// відмовила», «людини не було» і «UI надіслав щось незрозуміле» — три
-// різні події в журналі при однаковому наслідку.
-//
-// Спершу спробуйте самі; цей тест стоїть на t.Skip, доки ви його не напишете.
+// Чотири шляхи ведуть у відмову, кожен зі своєю причиною: вікно
+// вичерпалось, контекст скасовано, канал закрито без відповіді,
+// нерозпізнане слово. П'ятий і шостий — явні "approve"/"reject" — єдині,
+// що дають не-відмову чи явну відмову людини.
 func TestApprovalTimeoutMeansRefusal(t *testing.T) {
-	t.Skip("ДЗ 10, п.7: доведіть, що таймаут = відмова з причиною, і зніміть цей Skip")
+	t.Run("timeout", func(t *testing.T) {
+		ch := make(chan string)
+		d := awaitReply(context.Background(), ch, 20*time.Millisecond)
+		if d.Status != approvals.TimedOut || d.Reason == "" {
+			t.Errorf("d = %+v, want TimedOut з причиною", d)
+		}
+	})
+	t.Run("canceled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		ch := make(chan string)
+		d := awaitReply(ctx, ch, time.Minute)
+		if d.Status != approvals.TimedOut || d.Reason == "" {
+			t.Errorf("d = %+v, want TimedOut з причиною (скасований контекст)", d)
+		}
+	})
+	t.Run("closed channel", func(t *testing.T) {
+		ch := make(chan string)
+		close(ch)
+		d := awaitReply(context.Background(), ch, time.Minute)
+		if d.Status != approvals.TimedOut || d.Reason == "" {
+			t.Errorf("d = %+v, want TimedOut з причиною (закритий канал)", d)
+		}
+	})
+	t.Run("unrecognized word", func(t *testing.T) {
+		ch := make(chan string, 1)
+		ch <- "maybe"
+		d := awaitReply(context.Background(), ch, time.Minute)
+		if d.Status != approvals.Invalid || d.Reason == "" {
+			t.Errorf("d = %+v, want Invalid з причиною", d)
+		}
+	})
+	t.Run("explicit reject", func(t *testing.T) {
+		ch := make(chan string, 1)
+		ch <- "reject"
+		d := awaitReply(context.Background(), ch, time.Minute)
+		if d.Status != approvals.Denied {
+			t.Errorf("d = %+v, want Denied", d)
+		}
+	})
+	t.Run("explicit approve", func(t *testing.T) {
+		ch := make(chan string, 1)
+		ch <- "approve"
+		d := awaitReply(context.Background(), ch, time.Minute)
+		if d.Status != approvals.Approved {
+			t.Errorf("d = %+v, want Approved", d)
+		}
+	})
 }
 
 // TestRiskToolReturnsOnlySourcedFindings — ранній win, без моделі: кожен факт
